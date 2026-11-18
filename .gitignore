@@ -1,0 +1,20 @@
+# machine-specific, never share (real DB paths / conda env names)
+assets/rt-rep-seq.config.json
+
+# runtime artifacts -- none of this is source
+__pycache__/
+*.pyc
+work/
+results/
+batches/
+demultiplexed_fastq/
+latest/
+*.log
+onrepseq_launcher_test/
+
+# editor/OS cruft
+.DS_Store
+
+# test genomes (downloaded by test/simulate_test_data.py)
+test/genomes/
+README_preview.html

@@ -1,0 +1,18 @@
+# Conda environment for RT-Rep-Seq (Linux; created by install.sh)
+#   conda env create -f environment.yml
+name: rt-rep-seq
+channels:
+  - conda-forge
+  - bioconda
+  - nodefaults
+dependencies:
+  - python=3.11
+  - numpy>=2.0
+  - scipy>=1.13
+  - biopython>=1.79
+  - matplotlib-base>=3.7
+  - psutil>=5.9
+  - metabuli>=1.2.0
+  - pip
+  - pip:
+      - polyleven>=0.7

@@ -1,0 +1,14 @@
+{
+  "_comment": "Machine-specific settings. install.sh writes this file; or copy it to rt-rep-seq.config.json and edit. Only gtdb_db is required.",
+  "gtdb_db": "/path/to/metabuli/database",
+  "metabuli_bin": "",
+  "metabuli_env": "",
+  "cpu_frac": 0.5,
+  "mem_frac": 0.5,
+  "threads": "auto",
+  "min_reads": 10000,
+  "analysis_min_reads": 1,
+  "demux_poll_interval": 5,
+  "analysis_poll_interval": 10,
+  "db_description": ""
+}

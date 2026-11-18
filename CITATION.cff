@@ -1,0 +1,36 @@
+cff-version: 1.2.0
+message: "If you use RT-Rep-Seq, please cite the ON-rep-seq method (preferred citation) and this software."
+title: "RT-Rep-Seq: real-time ON-rep-seq analysis"
+version: 1.1.0
+date-released: 2026-11-18
+license: MIT
+repository-code: "https://github.com/krychu84/RT-Rep-Seq"
+authors:
+  - family-names: Krych
+    given-names: Łukasz
+    affiliation: "Department of Food Science, University of Copenhagen"
+preferred-citation:
+  type: article
+  title: "DNA enrichment and tagmentation method for species-level identification and strain-level differentiation using ON-rep-seq"
+  journal: "Communications Biology"
+  volume: 2
+  start: 369
+  year: 2019
+  doi: "10.1038/s42003-019-0617-x"
+  authors:
+    - family-names: Krych
+      given-names: Łukasz
+    - family-names: Castro-Mejía
+      given-names: Josué L.
+    - family-names: Forero-Junco
+      given-names: Laura M.
+    - family-names: Moesby
+      given-names: Daniel N.
+    - family-names: Mikkelsen
+      given-names: Morten B.
+    - family-names: Rasmussen
+      given-names: Morten A.
+    - family-names: Sykulski
+      given-names: Maciej
+    - family-names: Nielsen
+      given-names: Dennis S.

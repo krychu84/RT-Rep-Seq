@@ -1,0 +1,476 @@
+#!/usr/bin/env python3
+"""RT-Rep-Seq -- real-time ON-rep-seq analysis while the sequencer is running.
+
+Usage (cd into the folder MinKNOW writes the run's *.fastq(.gz) files to, e.g. fastq_pass/):
+
+    RT-Rep-Seq                 start (or resume) the analysis of this folder + live terminal view
+    RT-Rep-Seq --status [DIR]  re-open the live view of a running analysis (default: the most recent)
+    RT-Rep-Seq --stop [DIR]    stop it after the current analysis round (--now: immediately)
+    RT-Rep-Seq --no-view       start and return to the prompt straight away
+
+What it does: two background workers -- demux_watcher.py (demultiplexes every new fastq file
+exactly once) and analysis_watcher.py (re-runs species classification, read-length profiles,
+strain grouping and the HTML report whenever new reads are demultiplexed) -- run inside ONE
+resource budget of at most 50% of the CPU cores and 50% of the RAM of this computer (config:
+cpu_frac / mem_frac), so the analysis never competes with MinKNOW and basecalling. Metabuli is
+given a matching --threads and --max-ram.
+
+Results go to ~/Desktop/RT-Rep-Seq_<run name>_<YYYY-MM-DD_HHMM>/ (printed at start):
+    latest/report.html     the live report -- open it in a browser, it updates itself
+    batches/batchNN/       every analysis round, kept
+    demultiplexed_fastq/   reads per barcode;  *.log  worker logs
+Nothing is ever written into the MinKNOW folder. Starting RT-Rep-Seq again in the same folder
+resumes the same results folder (files already demultiplexed are not processed twice).
+
+One-time setup per machine: install.sh (or copy assets/rt-rep-seq.config.example.json to
+assets/rt-rep-seq.config.json and fill in the Metabuli database path).
+"""
+import argparse
+import datetime
+import glob
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import time
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+sys.path.insert(0, HERE)
+import rt_rep_seq as rt  # noqa: E402
+
+try:
+    import psutil
+except ImportError:
+    psutil = None
+
+CONFIG_PATH = os.path.join(HERE, 'assets', 'rt-rep-seq.config.json')
+EXAMPLE_CONFIG_PATH = os.path.join(HERE, 'assets', 'rt-rep-seq.config.example.json')
+STATE_DIR = os.path.expanduser('~/.rt-rep-seq')
+C = rt.colour
+
+
+# ---------------------------------------------------------------------------- setup
+def load_config():
+    if not os.path.exists(CONFIG_PATH):
+        sys.exit(f'[RT-Rep-Seq] one-time setup needed on this machine: run install.sh, or\n'
+                 f'  cp {EXAMPLE_CONFIG_PATH} {CONFIG_PATH}\n'
+                 f'  and set "gtdb_db" to the Metabuli database folder.')
+    with open(CONFIG_PATH) as f:
+        config = json.load(f)
+    if not config.get('gtdb_db'):
+        sys.exit(f'[RT-Rep-Seq] {CONFIG_PATH}: "gtdb_db" (Metabuli database folder) is not set')
+    if not os.path.isdir(config['gtdb_db']):
+        sys.exit(f"[RT-Rep-Seq] Metabuli database not found: {config['gtdb_db']} (set gtdb_db in {CONFIG_PATH})")
+    if not config.get('metabuli_env') and not shutil.which(config.get('metabuli_bin') or 'metabuli'):
+        sys.exit('[RT-Rep-Seq] metabuli not found: set "metabuli_bin" (path to the metabuli executable) or '
+                 f'"metabuli_env" (conda environment name) in {CONFIG_PATH}')
+    return config
+
+
+def run_name_for(input_dir):
+    """MinKNOW layout: <experiment>/<sample>/<YYYYMMDD_HHMM_position_flowcell_id>/fastq_pass[/barcodeNN].
+    Name = experiment (plus the sample name unless it is MinKNOW's default 'no_sample')."""
+    import re
+    parts = [p for p in os.path.normpath(input_dir).split(os.sep) if p]
+    while parts and parts[-1].startswith(('barcode', 'fastq_pass', 'fastq', 'pass', 'unclassified')):
+        parts.pop()
+    if parts and re.match(r'^\d{8}_', parts[-1]):          # MinKNOW flow-cell run folder
+        flowcell_dir = parts.pop()
+        sample = parts.pop() if parts else ''
+        experiment = parts[-1] if parts else flowcell_dir
+        name = experiment if sample in ('', 'no_sample', experiment) else f'{experiment}_{sample}'
+    else:
+        name = parts[-1] if parts else 'run'
+    return ''.join(ch if ch.isalnum() or ch in '-_.' else '_' for ch in name)
+
+
+def results_dirs():
+    return sorted(glob.glob(os.path.expanduser('~/Desktop/RT-Rep-Seq_*/run_info.json')),
+                  key=os.path.getmtime, reverse=True)
+
+
+def find_results_for(input_dir):
+    for info_path in results_dirs():
+        try:
+            if json.load(open(info_path)).get('input_dir') == input_dir:
+                return os.path.dirname(info_path)
+        except (OSError, ValueError):
+            pass
+    return None
+
+
+def alive(pid, needle):
+    if not pid:
+        return False
+    try:
+        if psutil:
+            p = psutil.Process(pid)
+            return p.is_running() and p.status() != psutil.STATUS_ZOMBIE and needle in ' '.join(p.cmdline())
+        os.kill(pid, 0)
+        return True
+    except Exception:
+        return False
+
+
+def workers_alive(info):
+    return (alive(info.get('demux_pid'), 'demux_watcher.py'), alive(info.get('analysis_pid'), 'analysis_watcher.py'))
+
+
+def launch(cmd, log_path):
+    """Background worker in its own session (survives Ctrl-C and closing the terminal)."""
+    log_f = open(log_path, 'a')
+    return subprocess.Popen(cmd, stdout=log_f, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                             start_new_session=True)
+
+
+def gb(n):
+    return f'{n / 2 ** 30:.1f} GB' if n else '?'
+
+
+def short(path):
+    home = os.path.expanduser('~')
+    return '~' + path[len(home):] if path.startswith(home) else path
+
+
+# ---------------------------------------------------------------------------- live view
+def read_json(path):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def cgroup_memory(pid):
+    """(process memory, file cache, max) bytes of the cgroup (systemd scope) the worker runs in.
+    The cap counts both, but file cache (e.g. the Metabuli database being read) is released by
+    the kernel whenever memory gets tight, so process memory is what really matters."""
+    try:
+        rel = [l.split(':', 2)[2].strip() for l in open(f'/proc/{pid}/cgroup') if l.startswith('0::')][0]
+        base = '/sys/fs/cgroup' + rel
+        mx = open(base + '/memory.max').read().strip()
+        if mx == 'max':
+            return None, None, None          # not a capped scope -> fall back to process RSS
+        stat = dict(l.split() for l in open(base + '/memory.stat') if len(l.split()) == 2)
+        return int(stat.get('anon', 0)), int(stat.get('file', 0)), int(mx)
+    except Exception:
+        return None, None, None
+
+
+_PROCS = {}   # pid -> psutil.Process, kept between refreshes (cpu_percent needs the same object)
+
+
+def tree_usage(pids):
+    """CPU % of the whole machine and RSS of the workers + everything they started (Metabuli)."""
+    if not psutil:
+        return None, None
+    procs = []
+    for pid in pids:
+        try:
+            p = _PROCS.setdefault(pid, psutil.Process(pid))
+            procs.append(p)
+            for c in p.children(recursive=True):
+                procs.append(_PROCS.setdefault(c.pid, c))
+        except psutil.Error:
+            pass
+    cpu = rss = 0.0
+    for p in procs:
+        try:
+            cpu += p.cpu_percent(None)
+            rss += p.memory_info().rss
+        except psutil.Error:
+            pass
+    return cpu / (os.cpu_count() or 1), rss
+
+
+def bar(frac, width=28):
+    frac = max(0.0, min(1.0, frac))
+    n = int(round(width * frac))
+    return C('█' * n, '32') + C('░' * (width - n), '2')
+
+
+def dur(sec):
+    sec = int(max(0, sec))
+    return f'{sec // 3600}h{sec % 3600 // 60:02d}m' if sec >= 3600 else f'{sec // 60}m{sec % 60:02d}s'
+
+
+def frame(res_dir, info, width):
+    dm = read_json(os.path.join(res_dir, '.status', 'demux.json'))
+    an = read_json(os.path.join(res_dir, '.status', 'analysis.json'))
+    d_alive, a_alive = workers_alive(info)
+    now = time.time()
+    L = []
+    rule = C('─' * min(width - 2, 96), '2')
+    L.append(rule)
+    # -- step 1: demultiplexing
+    present, done = dm.get('files_present') or 0, dm.get('files_done') or 0
+    head = C(' 1  Demultiplexing ', '1;36')
+    if not d_alive:
+        L.append(head + C('stopped', '31'))
+    else:
+        L.append(head + f'{bar(done / present if present else 0)} {done}/{present} fastq files  '
+                 + C(dm.get('state', 'starting'), '2'))
+    L.append(f'    {dm.get("reads", 0):,} reads in {dm.get("barcodes", 0)} barcodes · '
+             f'{dm.get("n_pass", 0)} barcode{"" if dm.get("n_pass", 0) == 1 else "s"} ≥ {dm.get("min_reads", 10000):,} reads'
+             + (f' · now: {dm["current"]}' if dm.get('current') and dm.get('state') == 'demultiplexing' else ''))
+    # -- step 2: analysis rounds
+    head = C(' 2  Analysis      ', '1;36')
+    state = an.get('state', 'starting')
+    if not a_alive:
+        L.append(head + C('stopped', '31'))
+    elif state == 'running':
+        step, n = an.get('step') or 0, an.get('n_steps') or 5
+        L.append(head + f'{bar((step - 1) / n if step else 0)} round {an.get("batch", "?")[5:] or "?"} · '
+                 f'step {step}/{n}: {C(rt.STEP_NAMES.get(step, an.get("step_name", "")), "1")}')
+        sub = '    '
+        if an.get('progress'):
+            cur, tot, what = an['progress']
+            sub += f'{bar(cur / tot if tot else 0, 20)} {what} {cur}/{tot}'
+        elif an.get('running'):
+            sub += f'{an["running"]} running · {dur(now - an.get("running_start", now))} (no progress information from Metabuli)'
+        else:
+            sub += f'step running · {dur(now - an.get("step_start", now))}'
+        L.append(sub + C(f'  · round started {dur(now - an.get("batch_start", now))} ago', '2'))
+    else:
+        L.append(head + C(state, '32' if state == 'up to date' else ('31' if 'error' in state else '33')))
+        if an.get('error'):
+            L.append('    ' + C(an['error'][:width - 6], '31'))
+    if an.get('last_batch'):
+        L.append(f'    last report: round {an["last_batch"][5:]} at '
+                 f'{datetime.datetime.fromtimestamp(an["last_done"]).strftime("%H:%M")} '
+                 f'({an.get("last_barcodes", "?")} barcodes) → {short(os.path.join(res_dir, "latest", "report.html"))}')
+    else:
+        L.append('    ' + C('first report appears after the first analysis round', '2'))
+    # -- resources
+    pids = [info.get('demux_pid'), info.get('analysis_pid')]
+    cpu, rss = tree_usage([p for p in pids if p])
+    anon, cache, mem_max = cgroup_memory(info.get('analysis_pid') or info.get('demux_pid') or 0)
+    mem_used = anon if anon is not None else rss
+    mem_cap = mem_max or info.get('mem_limit')
+    sys_cpu = psutil.cpu_percent(None) if psutil else 0
+    sys_mem = psutil.virtual_memory().percent if psutil else 0
+    L.append(rule)
+    L.append(C(' Resources ', '1') + f' RT-Rep-Seq   CPU {cpu or 0:4.1f}% (cap {info.get("cpu_frac", 0.5) * 100:.0f}% = '
+             f'{info.get("n_cores", "?")} cores) · RAM {gb(mem_used)} of {gb(mem_cap)} cap'
+             + ('' if info.get('mem_enforced') else C(' (cap not enforced)', '33')))
+    L.append(f'            whole PC     CPU {sys_cpu:4.1f}% · RAM {sys_mem:.0f}%'
+             + (C(f'  · file cache {gb(cache)} (released when needed)', '2') if cache else ''))
+    L.append(rule)
+    L.append(C(' Ctrl-C', '1') + ' leave this view (analysis keeps running) · '
+             + C('RT-Rep-Seq --status', '1') + ' come back · ' + C('RT-Rep-Seq --stop', '1') + ' stop')
+    return [l[:width + 40] for l in L]   # (colour codes don't take space)
+
+
+_ANSI = re.compile(r'\033\[[0-9;]*m')
+
+
+def clip(line, width):
+    """Cut a line to `width` visible characters (ANSI colour codes kept) so it never wraps;
+    a wrapped line would break the in-place redraw of the live view."""
+    if len(_ANSI.sub('', line)) <= width:
+        return line
+    out, vis, pos = [], 0, 0
+    for m in _ANSI.finditer(line):
+        seg = line[pos:m.start()]
+        if vis + len(seg) >= width:
+            out.append(seg[:max(0, width - 1 - vis)] + '\u2026')
+            return ''.join(out) + '\033[0m'
+        out.append(seg + m.group(0))
+        vis += len(seg)
+        pos = m.end()
+    seg = line[pos:]
+    out.append(seg[:max(0, width - 1 - vis)] + '\u2026')
+    return ''.join(out) + '\033[0m'
+
+
+def view(res_dir, once=False):
+    info = read_json(os.path.join(res_dir, 'run_info.json'))
+    if psutil:
+        psutil.cpu_percent(None)
+        tree_usage([p for p in (info.get('demux_pid'), info.get('analysis_pid')) if p])
+    tty = sys.stdout.isatty()
+    if once or not tty:
+        time.sleep(1.0)
+        print('\n'.join(frame(res_dir, info, shutil.get_terminal_size((110, 30)).columns)))
+        return
+    prev = 0
+    try:
+        while True:
+            cols = shutil.get_terminal_size((110, 30)).columns
+            lines = [clip(ln, cols - 1) for ln in frame(res_dir, info, cols)]
+            out = (f'\033[{prev}F' if prev else '') + '\033[J' + '\n'.join(lines) + '\n'
+            sys.stdout.write(out)
+            sys.stdout.flush()
+            prev = len(lines)
+            d_alive, a_alive = workers_alive(info)
+            if not d_alive and not a_alive:
+                print(C(' Both workers have stopped.', '33'), f'Results: {short(res_dir)}')
+                return
+            time.sleep(2)
+    except KeyboardInterrupt:
+        print('\n' + C(' Left the live view -- the analysis keeps running in the background.', '1'))
+        print(f'   live report : {short(os.path.join(res_dir, "latest", "report.html"))}')
+        print('   come back   : RT-Rep-Seq --status      stop: RT-Rep-Seq --stop')
+
+
+# ---------------------------------------------------------------------------- commands
+def pick_dir(arg):
+    if arg:
+        d = os.path.abspath(os.path.expanduser(arg))
+        if not os.path.exists(os.path.join(d, 'run_info.json')):
+            sys.exit(f'[RT-Rep-Seq] not an RT-Rep-Seq results folder: {d}')
+        return d
+    for info_path in results_dirs():   # most recent first; prefer one that is running
+        if any(workers_alive(read_json(info_path))):
+            return os.path.dirname(info_path)
+    found = results_dirs()
+    if not found:
+        sys.exit('[RT-Rep-Seq] no RT-Rep-Seq results folder found on the Desktop')
+    return os.path.dirname(found[0])
+
+
+def cmd_stop(res_dir, now=False):
+    info = read_json(os.path.join(res_dir, 'run_info.json'))
+    demux_dir = os.path.join(res_dir, 'demultiplexed_fastq')
+    for m in ('.demux_watcher_stop', '.analysis_watcher_stop'):
+        open(os.path.join(demux_dir, m), 'w').close()
+    if now:
+        for key in ('demux_pid', 'analysis_pid'):
+            pid = info.get(key)
+            if pid and alive(pid, 'watcher.py'):
+                try:
+                    os.killpg(os.getpgid(pid), signal.SIGTERM)   # worker + Metabuli (same session)
+                except OSError:
+                    pass
+        print(f'[RT-Rep-Seq] stopped immediately: {short(res_dir)}')
+        return
+    print(f'[RT-Rep-Seq] stop requested for {short(res_dir)}')
+    print('  workers finish the current file / analysis round first (an analysis round can take ~15 min);')
+    print('  use  RT-Rep-Seq --stop --now  to stop immediately.')
+
+
+def cmd_start(args):
+    config = load_config()
+    if args.min_reads is not None:
+        config['min_reads'] = args.min_reads
+    input_dir = os.getcwd()
+    cpu_frac = float(config.get('cpu_frac', 0.5))
+    mem_frac = float(config.get('mem_frac', 0.5))
+    budget = rt.Resources(cpu_frac, mem_frac)
+
+    # one shared RAM cap for everything RT-Rep-Seq starts: re-exec this launcher once inside a
+    # systemd user scope with MemoryMax = mem_frac x RAM; both workers and Metabuli inherit it
+    if not args.no_mem_cap:
+        budget.reexec_with_mem_cap(sys.argv)
+    budget.apply_cpu_cap()   # pins this process + all children to cpu_frac of the cores
+
+    rt.banner()
+    existing = find_results_for(input_dir)
+    if existing and any(workers_alive(read_json(os.path.join(existing, 'run_info.json')))):
+        print(C(' This folder is already being analysed -- showing the live view.', '1;33'))
+        print(f'   results folder: {short(existing)}\n')
+        return view(existing)
+
+    run_name = run_name_for(input_dir)
+    if existing:
+        res_dir, resumed = existing, True
+    else:
+        stamp = datetime.datetime.now().strftime('%Y-%m-%d_%H%M')
+        res_dir, resumed = os.path.expanduser(f'~/Desktop/RT-Rep-Seq_{run_name}_{stamp}'), False
+    demux_dir = os.path.join(res_dir, 'demultiplexed_fastq')
+    os.makedirs(demux_dir, exist_ok=True)
+    for m in ('.demux_watcher_stop', '.analysis_watcher_stop'):
+        try:
+            os.remove(os.path.join(demux_dir, m))
+        except FileNotFoundError:
+            pass
+
+    n_fastq = len(glob.glob(os.path.join(input_dir, '*.fastq')) + glob.glob(os.path.join(input_dir, '*.fastq.gz')))
+    n_cores = len(budget.cpus)
+    max_ram = max(4, int(budget.mem_limit / 2 ** 30 * 0.75)) if budget.mem_limit else None
+    threads = config.get('threads') if isinstance(config.get('threads'), int) else n_cores
+    metabuli = (f'conda env "{config["metabuli_env"]}"' if config.get('metabuli_env')
+                else (config.get('metabuli_bin') or shutil.which('metabuli')))
+
+    W = 18
+    row = lambda k, v: print(' ' + C(k.ljust(W), '1') + v)
+    print(C(' Run', '1;31'))
+    row('Input (MinKNOW)', f'{input_dir}  ' + C(f'({n_fastq} fastq files now)', '2'))
+    row('Run name', run_name)
+    print(C(' Results', '1;31') + C('  (all output is written here, nothing into the MinKNOW folder)', '2'))
+    row('Folder', C(short(res_dir) + '/', '1;32') + (C('  (resumed)', '33') if resumed else C('  (new)', '2')))
+    row('  live report', 'latest/report.html  ' + C('<- open in a browser; reloads itself after every analysis round', '2'))
+    row('  history', 'batches/batchNN/   every analysis round, kept')
+    row('  logs', 'demux_watcher.log, analysis_watcher.log')
+    print(C(' Resource budget', '1;31') + C('  (leaves the rest for MinKNOW / basecalling)', '2'))
+    row('CPU', f'{n_cores} of {os.cpu_count()} cores ({cpu_frac * 100:.0f}%), nice 10')
+    row('RAM', f'{gb(budget.mem_limit)} of {gb(budget.mem_total)} ({mem_frac * 100:.0f}%)'
+        + ('' if budget.mem_capped else C('  -- NOT enforced (systemd-run user scope unavailable)', '33')))
+    row('Metabuli', f'--threads {threads} --max-ram {max_ram} GiB  ({metabuli})')
+    row('Database', config['gtdb_db'])
+    print()
+
+    common = ['--cpu-frac', str(cpu_frac), '--mem-frac', str(mem_frac), '--no-mem-cap', '--no-banner']
+    demux_cmd = [sys.executable, os.path.join(HERE, 'demux_watcher.py'), '--raw-dir', input_dir,
+                 '--demux-dir', demux_dir, '--min-reads', str(config.get('min_reads', 10000)),
+                 '--poll-interval', str(config.get('demux_poll_interval', 5))] + common
+    analysis_cmd = [sys.executable, os.path.join(HERE, 'analysis_watcher.py'),
+                    '--demux-dir', demux_dir, '--batches-dir', os.path.join(res_dir, 'batches'),
+                    '--latest-dir', os.path.join(res_dir, 'latest'), '--gtdb-db', config['gtdb_db'],
+                    '--min-reads', str(config.get('analysis_min_reads', 1)),
+                    '--qc-min-reads', str(config.get('min_reads', 10000)), '--run-name', run_name,
+                    '--threads', str(threads),
+                    '--poll-interval', str(config.get('analysis_poll_interval', 10))] + common
+    if config.get('metabuli_env'):
+        analysis_cmd += ['--metabuli-env', config['metabuli_env']]
+    else:
+        analysis_cmd += ['--metabuli-bin', config.get('metabuli_bin') or shutil.which('metabuli')]
+    dp = launch(demux_cmd, os.path.join(res_dir, 'demux_watcher.log'))
+    ap_ = launch(analysis_cmd, os.path.join(res_dir, 'analysis_watcher.log'))
+
+    info = {'input_dir': input_dir, 'run_name': run_name, 'results_dir': res_dir, 'started': time.time(),
+            'demux_pid': dp.pid, 'analysis_pid': ap_.pid, 'cpu_frac': cpu_frac, 'mem_frac': mem_frac,
+            'n_cores': n_cores, 'mem_limit': budget.mem_limit, 'mem_enforced': budget.mem_capped,
+            'version': rt.VERSION}
+    with open(os.path.join(res_dir, 'run_info.json'), 'w') as f:
+        json.dump(info, f, indent=1)
+    os.makedirs(STATE_DIR, exist_ok=True)
+    with open(os.path.join(STATE_DIR, 'last_run'), 'w') as f:
+        f.write(res_dir + '\n')
+    print(C(' Started.', '1;32') + f' demultiplexing (pid {dp.pid}) and analysis (pid {ap_.pid}) run in the background.\n')
+    if args.no_view or not sys.stdout.isatty():
+        print(f'   live report : {short(os.path.join(res_dir, "latest", "report.html"))}')
+        print('   live view   : RT-Rep-Seq --status      stop: RT-Rep-Seq --stop')
+        return
+    view(res_dir)
+
+
+def main():
+    ap = argparse.ArgumentParser(prog='RT-Rep-Seq', description=__doc__,
+                                  formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument('--status', nargs='?', const='', metavar='DIR', help='live view of a running analysis')
+    ap.add_argument('--stop', nargs='?', const='', metavar='DIR', help='stop an analysis after its current round')
+    ap.add_argument('--now', action='store_true', help='with --stop: stop immediately')
+    ap.add_argument('--no-view', action='store_true', help='start and return to the prompt')
+    ap.add_argument('--min-reads', type=int, metavar='N', help='read threshold per barcode: start value of the report slider '
+                    'and QC count in the live view (default: min_reads in the config, 10000)')
+    ap.add_argument('--once', action='store_true', help=argparse.SUPPRESS)       # one frame (docs/screenshots)
+    ap.add_argument('--no-mem-cap', action='store_true', help=argparse.SUPPRESS)
+    ap.add_argument('--version', action='version', version=f'RT-Rep-Seq {rt.VERSION}')
+    args = ap.parse_args()
+    if args.stop is not None:
+        return cmd_stop(pick_dir(args.stop), now=args.now)
+    if args.status is not None:
+        d = pick_dir(args.status)
+        if not args.once:
+            rt.banner()
+            print(f' {C("Results folder", "1")}  {C(short(d) + "/", "1;32")}\n')
+        return view(d, once=args.once)
+    cmd_start(args)
+
+
+if __name__ == '__main__':
+    main()

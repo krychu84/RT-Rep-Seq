@@ -1,0 +1,17 @@
+{
+  "sequence": {
+    "minimum_average_phred_quality": 8,
+    "min_sequence_length": 300,
+    "max_sequence_length": 6000,
+    "sequence_headcrop": 0,
+    "sequence_tailcrop": 0,
+    "barcode_window_size": 150
+  },
+  "amplicones": {
+    "barcode_length": 24,
+    "spacer_length": 15,
+    "linker_length": 15,
+    "use_linker_anchor": false
+  },
+  "max_barcode_distance": 5
+}
